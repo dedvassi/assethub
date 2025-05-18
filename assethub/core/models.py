@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any
 from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, ForeignKey, Table, Text, JSON
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship, sessionmaker
+from sqlalchemy.orm import relationship, sessionmaker, backref
 from sqlalchemy import create_engine
 
 from assethub.core.config import config
@@ -136,7 +136,7 @@ class Category(Base):
     
     # Relationships
     assets = relationship("Asset", secondary=asset_categories, back_populates="categories")
-    children = relationship("Category", backref=relationship("Category", remote_side=[id]))
+    children = relationship("Category", backref=backref("parent", remote_side=[id]))
     
     def __repr__(self):
         return f"<Category(id={self.id}, name='{self.name}')>"
