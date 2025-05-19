@@ -1,641 +1,980 @@
 """
-Main application module for AssetHub GUI.
+Main application module for AssetHub.
 
-This module provides the main application window and UI components for AssetHub.
+This module provides the main application window and UI components
+for the AssetHub application, with a modern design inspired by Hamster 3D.
 """
 import os
 import sys
 import logging
+import threading
+import time
 from typing import List, Dict, Any, Optional
-from pathlib import Path
+from datetime import datetime
 
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLineEdit, QLabel, QComboBox, QFileDialog,
-    QListWidget, QListWidgetItem, QSplitter, QTabWidget,
-    QTreeView, QMenu, QMessageBox, QProgressBar, QStatusBar
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+    QPushButton, QLabel, QLineEdit, QComboBox, QScrollArea, 
+    QFrame, QSplitter, QFileDialog, QMessageBox, QProgressBar,
+    QTabWidget, QGridLayout, QCheckBox, QMenu, QAction, QToolBar,
+    QSizePolicy, QSpacerItem, QToolButton, QStatusBar
 )
-from PySide6.QtCore import Qt, QSize, Signal, Slot, QThread, QModelIndex
-from PySide6.QtGui import QIcon, QPixmap, QStandardItemModel, QStandardItem
+from PyQt5.QtCore import (
+    Qt, QSize, QThread, pyqtSignal, QTimer, QUrl, QRect, 
+    QPoint, QPropertyAnimation, QEasingCurve
+)
+from PyQt5.QtGui import (
+    QIcon, QPixmap, QFont, QPalette, QColor, QCursor, 
+    QImage, QPainter, QBrush, QLinearGradient, QFontDatabase
+)
 
 from assethub.core.config import config
-from assethub.catalog.scanner import AssetScanner
-from assethub.catalog.indexer import AssetIndexer
+from assethub.core.models import Asset, Category, SearchIndex
+from assethub.catalog.scanner import FileScanner
+from assethub.catalog.indexer import Indexer
 from assethub.catalog.search import AssetSearch
-from assethub.integration import integration_manager
+from assethub.integration import get_providers
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Set up logging
 logger = logging.getLogger(__name__)
 
+# Constants
+DARK_BG_COLOR = "#1E1E1E"
+DARKER_BG_COLOR = "#141414"
+ACCENT_COLOR = "#8C52FF"  # Purple accent color
+ACCENT_COLOR_HOVER = "#9D6FFF"
+TEXT_COLOR = "#FFFFFF"
+SECONDARY_TEXT_COLOR = "#AAAAAA"
+BORDER_COLOR = "#333333"
+CARD_BG_COLOR = "#2A2A2A"
+CARD_HOVER_COLOR = "#3A3A3A"
+SIDEBAR_WIDTH = 250
+CARD_WIDTH = 220
+CARD_HEIGHT = 280
+CARD_SPACING = 15
+ANIMATION_DURATION = 200  # ms
 
-class ScanWorker(QThread):
-    """Worker thread for scanning directories."""
+# Asset type icons
+ASSET_TYPE_ICONS = {
+    "model": "icons/model.png",
+    "texture": "icons/texture.png",
+    "material": "icons/material.png",
+    "hdri": "icons/hdri.png",
+    "other": "icons/other.png"
+}
+
+class AssetCard(QFrame):
+    """Card widget for displaying an asset."""
     
-    progress = Signal(int, int)  # new_assets, updated_assets
-    finished = Signal()
+    clicked = pyqtSignal(object)
     
-    def __init__(self, directory: str, recursive: bool = True):
-        """
-        Initialize the scan worker.
+    def __init__(self, asset: Asset, parent=None):
+        """Initialize the asset card.
         
         Args:
-            directory: Directory to scan
-            recursive: Whether to scan recursively
+            asset: Asset to display
+            parent: Parent widget
         """
-        super().__init__()
-        self.directory = directory
-        self.recursive = recursive
-        self.scanner = AssetScanner()
+        super().__init__(parent)
+        self.asset = asset
+        self.is_hovered = False
+        self.setup_ui()
         
-    def run(self):
-        """Run the scan operation."""
-        try:
-            new_assets, updated_assets = self.scanner.scan_directory(
-                self.directory, self.recursive
-            )
-            self.progress.emit(new_assets, updated_assets)
-        except Exception as e:
-            logger.error(f"Error scanning directory: {e}")
-        finally:
-            self.finished.emit()
-
-
-class IndexWorker(QThread):
-    """Worker thread for indexing assets."""
-    
-    progress = Signal(int)  # indexed_assets
-    finished = Signal()
-    
-    def __init__(self, rebuild: bool = False):
-        """
-        Initialize the index worker.
+    def setup_ui(self):
+        """Set up the UI components."""
+        # Set up the card appearance
+        self.setFixedSize(CARD_WIDTH, CARD_HEIGHT)
+        self.setObjectName("assetCard")
+        self.setStyleSheet(f"""
+            #assetCard {{
+                background-color: {CARD_BG_COLOR};
+                border-radius: 8px;
+                border: 1px solid {BORDER_COLOR};
+            }}
+            #assetCard:hover {{
+                background-color: {CARD_HOVER_COLOR};
+                border: 1px solid {ACCENT_COLOR};
+            }}
+            QLabel {{
+                color: {TEXT_COLOR};
+            }}
+        """)
         
-        Args:
-            rebuild: Whether to rebuild the index from scratch
-        """
-        super().__init__()
-        self.rebuild = rebuild
-        self.indexer = AssetIndexer()
+        # Main layout
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(5)
         
-    def run(self):
-        """Run the indexing operation."""
-        try:
-            if self.rebuild:
-                count = self.indexer.rebuild_index()
+        # Preview image
+        self.preview_label = QLabel()
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setMinimumHeight(140)
+        self.preview_label.setMaximumHeight(140)
+        self.preview_label.setStyleSheet(f"""
+            background-color: {DARKER_BG_COLOR};
+            border-radius: 4px;
+        """)
+        
+        # Load preview image if available
+        if hasattr(self.asset, 'preview_path') and os.path.exists(self.asset.preview_path):
+            pixmap = QPixmap(self.asset.preview_path)
+            pixmap = pixmap.scaled(CARD_WIDTH - 20, 140, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.preview_label.setPixmap(pixmap)
+        else:
+            # Use placeholder based on asset type
+            asset_type = self.asset.file_type if self.asset.file_type else "other"
+            icon_path = ASSET_TYPE_ICONS.get(asset_type, ASSET_TYPE_ICONS["other"])
+            if os.path.exists(icon_path):
+                pixmap = QPixmap(icon_path)
+                pixmap = pixmap.scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.preview_label.setPixmap(pixmap)
             else:
-                # Index new assets
-                from assethub.core.models import Asset, get_session
-                session = get_session()
-                assets = session.query(Asset).all()
-                count = self.indexer.index_assets(assets)
-            
-            self.progress.emit(count)
-        except Exception as e:
-            logger.error(f"Error indexing assets: {e}")
-        finally:
-            self.finished.emit()
+                self.preview_label.setText("No Preview")
+        
+        layout.addWidget(self.preview_label)
+        
+        # Asset name
+        self.name_label = QLabel(self.asset.name)
+        self.name_label.setWordWrap(True)
+        self.name_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.name_label.setStyleSheet(f"""
+            font-weight: bold;
+            font-size: 14px;
+            color: {TEXT_COLOR};
+        """)
+        layout.addWidget(self.name_label)
+        
+        # Asset type and format
+        type_format = f"{self.asset.file_type.capitalize()} • {self.asset.file_format.upper()}"
+        self.type_label = QLabel(type_format)
+        self.type_label.setStyleSheet(f"""
+            font-size: 12px;
+            color: {SECONDARY_TEXT_COLOR};
+        """)
+        layout.addWidget(self.type_label)
+        
+        # Source
+        self.source_label = QLabel(f"Source: {self.asset.source}")
+        self.source_label.setStyleSheet(f"""
+            font-size: 12px;
+            color: {SECONDARY_TEXT_COLOR};
+        """)
+        layout.addWidget(self.source_label)
+        
+        # Add spacer to push everything to the top
+        layout.addItem(QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding))
+        
+        # Bottom row with buttons
+        bottom_layout = QHBoxLayout()
+        bottom_layout.setSpacing(5)
+        
+        # Import button
+        self.import_button = QPushButton("Import")
+        self.import_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {ACCENT_COLOR};
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 5px 10px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: {ACCENT_COLOR_HOVER};
+            }}
+        """)
+        bottom_layout.addWidget(self.import_button)
+        
+        # Details button
+        self.details_button = QPushButton("Details")
+        self.details_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                color: {TEXT_COLOR};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 4px;
+                padding: 5px 10px;
+            }}
+            QPushButton:hover {{
+                border-color: {ACCENT_COLOR};
+                color: {ACCENT_COLOR};
+            }}
+        """)
+        bottom_layout.addWidget(self.details_button)
+        
+        layout.addLayout(bottom_layout)
+        
+    def enterEvent(self, event):
+        """Handle mouse enter event."""
+        self.is_hovered = True
+        self.update()
+        super().enterEvent(event)
+        
+    def leaveEvent(self, event):
+        """Handle mouse leave event."""
+        self.is_hovered = False
+        self.update()
+        super().leaveEvent(event)
+        
+    def mousePressEvent(self, event):
+        """Handle mouse press event."""
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self.asset)
+        super().mousePressEvent(event)
 
 
-class SearchWorker(QThread):
-    """Worker thread for searching assets."""
+class AssetGridWidget(QScrollArea):
+    """Widget for displaying a grid of assets."""
     
-    results = Signal(list)
-    finished = Signal()
-    
-    def __init__(self, query: str, filters: Optional[Dict[str, Any]] = None):
-        """
-        Initialize the search worker.
+    def __init__(self, parent=None):
+        """Initialize the asset grid widget.
         
         Args:
-            query: Search query
-            filters: Search filters
+            parent: Parent widget
         """
-        super().__init__()
-        self.query = query
-        self.filters = filters or {}
-        self.search = AssetSearch()
+        super().__init__(parent)
+        self.assets = []
+        self.setup_ui()
         
-    def run(self):
-        """Run the search operation."""
-        try:
-            results = self.search.search(self.query, filters=self.filters)
-            self.results.emit(results)
-        except Exception as e:
-            logger.error(f"Error searching assets: {e}")
-            self.results.emit([])
-        finally:
-            self.finished.emit()
+    def setup_ui(self):
+        """Set up the UI components."""
+        # Set up the scroll area
+        self.setWidgetResizable(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setStyleSheet(f"""
+            QScrollArea {{
+                background-color: {DARK_BG_COLOR};
+                border: none;
+            }}
+            QScrollBar:vertical {{
+                background-color: {DARKER_BG_COLOR};
+                width: 10px;
+                margin: 0px;
+            }}
+            QScrollBar::handle:vertical {{
+                background-color: {ACCENT_COLOR};
+                min-height: 20px;
+                border-radius: 5px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0px;
+            }}
+        """)
+        
+        # Create container widget
+        self.container = QWidget()
+        self.container.setStyleSheet(f"background-color: {DARK_BG_COLOR};")
+        
+        # Create grid layout
+        self.grid_layout = QGridLayout(self.container)
+        self.grid_layout.setContentsMargins(CARD_SPACING, CARD_SPACING, CARD_SPACING, CARD_SPACING)
+        self.grid_layout.setSpacing(CARD_SPACING)
+        
+        self.setWidget(self.container)
+        
+    def set_assets(self, assets: List[Asset]):
+        """Set the assets to display.
+        
+        Args:
+            assets: List of assets to display
+        """
+        # Clear existing assets
+        self.assets = assets
+        
+        # Clear the grid layout
+        while self.grid_layout.count():
+            item = self.grid_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        
+        # Add assets to the grid
+        columns = max(1, (self.width() - 2 * CARD_SPACING) // (CARD_WIDTH + CARD_SPACING))
+        for i, asset in enumerate(assets):
+            row = i // columns
+            col = i % columns
+            
+            card = AssetCard(asset)
+            card.clicked.connect(self.on_asset_clicked)
+            self.grid_layout.addWidget(card, row, col)
+            
+        # Add empty items to fill the grid
+        if assets:
+            for i in range(len(assets), (((len(assets) - 1) // columns) + 1) * columns):
+                row = i // columns
+                col = i % columns
+                spacer = QWidget()
+                spacer.setFixedSize(CARD_WIDTH, CARD_HEIGHT)
+                spacer.setStyleSheet("background-color: transparent;")
+                self.grid_layout.addWidget(spacer, row, col)
+    
+    def on_asset_clicked(self, asset):
+        """Handle asset click event.
+        
+        Args:
+            asset: Clicked asset
+        """
+        # Show asset details dialog
+        pass
+        
+    def resizeEvent(self, event):
+        """Handle resize event."""
+        # Recalculate grid layout when widget is resized
+        if self.assets:
+            self.set_assets(self.assets)
+        super().resizeEvent(event)
+
+
+class SidebarWidget(QWidget):
+    """Sidebar widget for filtering and navigation."""
+    
+    filter_changed = pyqtSignal(dict)
+    
+    def __init__(self, parent=None):
+        """Initialize the sidebar widget.
+        
+        Args:
+            parent: Parent widget
+        """
+        super().__init__(parent)
+        self.setup_ui()
+        
+    def setup_ui(self):
+        """Set up the UI components."""
+        # Set fixed width
+        self.setFixedWidth(SIDEBAR_WIDTH)
+        self.setStyleSheet(f"""
+            background-color: {DARKER_BG_COLOR};
+            border-right: 1px solid {BORDER_COLOR};
+        """)
+        
+        # Main layout
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(15)
+        
+        # Logo and title
+        logo_layout = QHBoxLayout()
+        logo_label = QLabel()
+        logo_pixmap = QPixmap("icons/logo.png")
+        if not logo_pixmap.isNull():
+            logo_label.setPixmap(logo_pixmap.scaled(32, 32, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            logo_label.setText("AH")
+            logo_label.setStyleSheet(f"""
+                font-size: 18px;
+                font-weight: bold;
+                color: {ACCENT_COLOR};
+                background-color: {DARK_BG_COLOR};
+                border-radius: 16px;
+                padding: 5px;
+            """)
+            logo_label.setFixedSize(32, 32)
+            logo_label.setAlignment(Qt.AlignCenter)
+        
+        logo_layout.addWidget(logo_label)
+        
+        title_label = QLabel("AssetHub")
+        title_label.setStyleSheet(f"""
+            font-size: 18px;
+            font-weight: bold;
+            color: {TEXT_COLOR};
+        """)
+        logo_layout.addWidget(title_label)
+        logo_layout.addStretch()
+        
+        layout.addLayout(logo_layout)
+        
+        # Search box
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search assets...")
+        self.search_edit.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: {DARK_BG_COLOR};
+                color: {TEXT_COLOR};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 4px;
+                padding: 8px;
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {ACCENT_COLOR};
+            }}
+        """)
+        self.search_edit.textChanged.connect(self.on_filter_changed)
+        layout.addWidget(self.search_edit)
+        
+        # Filters section
+        filters_label = QLabel("Filters")
+        filters_label.setStyleSheet(f"""
+            font-size: 14px;
+            font-weight: bold;
+            color: {TEXT_COLOR};
+        """)
+        layout.addWidget(filters_label)
+        
+        # Asset type filter
+        type_label = QLabel("Asset Type")
+        type_label.setStyleSheet(f"color: {SECONDARY_TEXT_COLOR};")
+        layout.addWidget(type_label)
+        
+        self.type_combo = QComboBox()
+        self.type_combo.addItem("All Types", "")
+        self.type_combo.addItem("3D Models", "model")
+        self.type_combo.addItem("Textures", "texture")
+        self.type_combo.addItem("Materials", "material")
+        self.type_combo.addItem("HDRIs", "hdri")
+        self.type_combo.setStyleSheet(f"""
+            QComboBox {{
+                background-color: {DARK_BG_COLOR};
+                color: {TEXT_COLOR};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 4px;
+                padding: 5px;
+            }}
+            QComboBox:hover {{
+                border: 1px solid {ACCENT_COLOR};
+            }}
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 20px;
+                border-left: 1px solid {BORDER_COLOR};
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {DARK_BG_COLOR};
+                color: {TEXT_COLOR};
+                selection-background-color: {ACCENT_COLOR};
+                selection-color: white;
+                border: 1px solid {BORDER_COLOR};
+            }}
+        """)
+        self.type_combo.currentIndexChanged.connect(self.on_filter_changed)
+        layout.addWidget(self.type_combo)
+        
+        # Format filter
+        format_label = QLabel("Format")
+        format_label.setStyleSheet(f"color: {SECONDARY_TEXT_COLOR};")
+        layout.addWidget(format_label)
+        
+        self.format_combo = QComboBox()
+        self.format_combo.addItem("All Formats", "")
+        self.format_combo.addItem("FBX", "fbx")
+        self.format_combo.addItem("OBJ", "obj")
+        self.format_combo.addItem("Blender", "blend")
+        self.format_combo.addItem("3ds Max", "max")
+        self.format_combo.addItem("PNG", "png")
+        self.format_combo.addItem("JPG", "jpg")
+        self.format_combo.setStyleSheet(f"""
+            QComboBox {{
+                background-color: {DARK_BG_COLOR};
+                color: {TEXT_COLOR};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 4px;
+                padding: 5px;
+            }}
+            QComboBox:hover {{
+                border: 1px solid {ACCENT_COLOR};
+            }}
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 20px;
+                border-left: 1px solid {BORDER_COLOR};
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {DARK_BG_COLOR};
+                color: {TEXT_COLOR};
+                selection-background-color: {ACCENT_COLOR};
+                selection-color: white;
+                border: 1px solid {BORDER_COLOR};
+            }}
+        """)
+        self.format_combo.currentIndexChanged.connect(self.on_filter_changed)
+        layout.addWidget(self.format_combo)
+        
+        # Source filter
+        source_label = QLabel("Source")
+        source_label.setStyleSheet(f"color: {SECONDARY_TEXT_COLOR};")
+        layout.addWidget(source_label)
+        
+        self.source_combo = QComboBox()
+        self.source_combo.addItem("All Sources", "")
+        self.source_combo.addItem("Local Library", "local")
+        self.source_combo.addItem("Poly Haven", "Poly Haven")
+        self.source_combo.addItem("Free3D", "Free3D")
+        self.source_combo.setStyleSheet(f"""
+            QComboBox {{
+                background-color: {DARK_BG_COLOR};
+                color: {TEXT_COLOR};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 4px;
+                padding: 5px;
+            }}
+            QComboBox:hover {{
+                border: 1px solid {ACCENT_COLOR};
+            }}
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 20px;
+                border-left: 1px solid {BORDER_COLOR};
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {DARK_BG_COLOR};
+                color: {TEXT_COLOR};
+                selection-background-color: {ACCENT_COLOR};
+                selection-color: white;
+                border: 1px solid {BORDER_COLOR};
+            }}
+        """)
+        self.source_combo.currentIndexChanged.connect(self.on_filter_changed)
+        layout.addWidget(self.source_combo)
+        
+        # Categories section
+        categories_label = QLabel("Categories")
+        categories_label.setStyleSheet(f"""
+            font-size: 14px;
+            font-weight: bold;
+            color: {TEXT_COLOR};
+            margin-top: 10px;
+        """)
+        layout.addWidget(categories_label)
+        
+        # Category checkboxes in a scroll area
+        categories_scroll = QScrollArea()
+        categories_scroll.setWidgetResizable(True)
+        categories_scroll.setStyleSheet(f"""
+            QScrollArea {{
+                background-color: transparent;
+                border: none;
+            }}
+            QScrollBar:vertical {{
+                background-color: {DARKER_BG_COLOR};
+                width: 8px;
+                margin: 0px;
+            }}
+            QScrollBar::handle:vertical {{
+                background-color: {ACCENT_COLOR};
+                min-height: 20px;
+                border-radius: 4px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0px;
+            }}
+        """)
+        
+        categories_widget = QWidget()
+        categories_layout = QVBoxLayout(categories_widget)
+        categories_layout.setContentsMargins(0, 0, 0, 0)
+        categories_layout.setSpacing(5)
+        
+        # Sample categories (will be populated dynamically)
+        sample_categories = [
+            "Furniture", "Architecture", "Characters", 
+            "Vehicles", "Nature", "Electronics", 
+            "Food", "Animals", "Sci-Fi"
+        ]
+        
+        self.category_checkboxes = {}
+        for category in sample_categories:
+            checkbox = QCheckBox(category)
+            checkbox.setStyleSheet(f"""
+                QCheckBox {{
+                    color: {TEXT_COLOR};
+                }}
+                QCheckBox::indicator {{
+                    width: 16px;
+                    height: 16px;
+                    border: 1px solid {BORDER_COLOR};
+                    border-radius: 3px;
+                    background-color: {DARK_BG_COLOR};
+                }}
+                QCheckBox::indicator:checked {{
+                    background-color: {ACCENT_COLOR};
+                    border: 1px solid {ACCENT_COLOR};
+                    image: url(icons/check.png);
+                }}
+                QCheckBox::indicator:hover {{
+                    border: 1px solid {ACCENT_COLOR};
+                }}
+            """)
+            checkbox.stateChanged.connect(self.on_filter_changed)
+            categories_layout.addWidget(checkbox)
+            self.category_checkboxes[category] = checkbox
+        
+        categories_layout.addStretch()
+        categories_scroll.setWidget(categories_widget)
+        layout.addWidget(categories_scroll)
+        
+        # Add spacer to push everything to the top
+        layout.addStretch()
+        
+        # Settings button at the bottom
+        self.settings_button = QPushButton("Settings")
+        self.settings_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                color: {SECONDARY_TEXT_COLOR};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 4px;
+                padding: 8px;
+                text-align: left;
+            }}
+            QPushButton:hover {{
+                color: {TEXT_COLOR};
+                border-color: {ACCENT_COLOR};
+            }}
+        """)
+        layout.addWidget(self.settings_button)
+        
+    def on_filter_changed(self, *args):
+        """Handle filter change events."""
+        # Collect all filter values
+        filters = {
+            "search": self.search_edit.text(),
+            "type": self.type_combo.currentData(),
+            "format": self.format_combo.currentData(),
+            "source": self.source_combo.currentData(),
+            "categories": [cat for cat, cb in self.category_checkboxes.items() if cb.isChecked()]
+        }
+        
+        # Emit signal with filter values
+        self.filter_changed.emit(filters)
 
 
 class AssetHubMainWindow(QMainWindow):
-    """Main window for AssetHub application."""
+    """Main window for the AssetHub application."""
     
     def __init__(self):
         """Initialize the main window."""
         super().__init__()
         
-        self.setWindowTitle("AssetHub")
-        self.setMinimumSize(1000, 700)
-        
         # Initialize components
-        self.init_ui()
-        
-        # Initialize search engine
+        self.indexer = Indexer()
         self.search = AssetSearch()
+        self.providers = get_providers()
         
-        # Initialize scanner and indexer
-        self.scanner = AssetScanner()
-        self.indexer = AssetIndexer()
+        # Create search index if it doesn't exist
         self.indexer.create_index()
         
-        # Load initial data
-        self.load_categories()
-        self.load_file_types()
+        # Set up the UI
+        self.setup_ui()
         
-    def init_ui(self):
-        """Initialize the user interface."""
-        # Central widget
+        # Load initial assets
+        self.load_assets()
+        
+    def setup_ui(self):
+        """Set up the UI components."""
+        # Set window properties
+        self.setWindowTitle("AssetHub")
+        self.setMinimumSize(1000, 600)
+        self.setStyleSheet(f"""
+            QMainWindow {{
+                background-color: {DARK_BG_COLOR};
+            }}
+        """)
+        
+        # Create central widget
         central_widget = QWidget()
-        self.setCentralWidget(central_widget)
+        main_layout = QHBoxLayout(central_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
         
-        # Main layout
-        main_layout = QVBoxLayout(central_widget)
+        # Create sidebar
+        self.sidebar = SidebarWidget()
+        self.sidebar.filter_changed.connect(self.apply_filters)
+        main_layout.addWidget(self.sidebar)
         
-        # Search bar
-        search_layout = QHBoxLayout()
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search assets...")
-        self.search_input.returnPressed.connect(self.on_search)
+        # Create right side container
+        right_container = QWidget()
+        right_layout = QVBoxLayout(right_container)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
         
-        self.search_button = QPushButton("Search")
-        self.search_button.clicked.connect(self.on_search)
+        # Create toolbar
+        toolbar = QWidget()
+        toolbar.setFixedHeight(60)
+        toolbar.setStyleSheet(f"""
+            background-color: {DARKER_BG_COLOR};
+            border-bottom: 1px solid {BORDER_COLOR};
+        """)
         
-        search_layout.addWidget(self.search_input)
-        search_layout.addWidget(self.search_button)
+        toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(15, 0, 15, 0)
         
-        main_layout.addLayout(search_layout)
+        # View mode buttons
+        view_group_layout = QHBoxLayout()
+        view_group_layout.setSpacing(1)
         
-        # Splitter for sidebar and content
-        splitter = QSplitter(Qt.Horizontal)
+        self.grid_view_button = QPushButton("Grid")
+        self.grid_view_button.setCheckable(True)
+        self.grid_view_button.setChecked(True)
+        self.grid_view_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {DARK_BG_COLOR};
+                color: {SECONDARY_TEXT_COLOR};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 0;
+                border-top-left-radius: 4px;
+                border-bottom-left-radius: 4px;
+                padding: 5px 15px;
+            }}
+            QPushButton:checked {{
+                background-color: {ACCENT_COLOR};
+                color: white;
+                border-color: {ACCENT_COLOR};
+            }}
+            QPushButton:hover:!checked {{
+                color: {TEXT_COLOR};
+            }}
+        """)
+        view_group_layout.addWidget(self.grid_view_button)
         
-        # Sidebar
-        sidebar = QWidget()
-        sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        self.list_view_button = QPushButton("List")
+        self.list_view_button.setCheckable(True)
+        self.list_view_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {DARK_BG_COLOR};
+                color: {SECONDARY_TEXT_COLOR};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 0;
+                border-top-right-radius: 4px;
+                border-bottom-right-radius: 4px;
+                padding: 5px 15px;
+            }}
+            QPushButton:checked {{
+                background-color: {ACCENT_COLOR};
+                color: white;
+                border-color: {ACCENT_COLOR};
+            }}
+            QPushButton:hover:!checked {{
+                color: {TEXT_COLOR};
+            }}
+        """)
+        view_group_layout.addWidget(self.list_view_button)
         
-        # Filters
-        filters_label = QLabel("Filters")
-        filters_label.setStyleSheet("font-weight: bold;")
+        toolbar_layout.addLayout(view_group_layout)
         
-        # Category filter
-        category_label = QLabel("Category:")
-        self.category_combo = QComboBox()
+        # Sort options
+        sort_label = QLabel("Sort by:")
+        sort_label.setStyleSheet(f"color: {SECONDARY_TEXT_COLOR};")
+        toolbar_layout.addWidget(sort_label)
         
-        # File type filter
-        file_type_label = QLabel("File Type:")
-        self.file_type_combo = QComboBox()
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItem("Name (A-Z)")
+        self.sort_combo.addItem("Name (Z-A)")
+        self.sort_combo.addItem("Newest First")
+        self.sort_combo.addItem("Oldest First")
+        self.sort_combo.setStyleSheet(f"""
+            QComboBox {{
+                background-color: {DARK_BG_COLOR};
+                color: {TEXT_COLOR};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 4px;
+                padding: 5px;
+                min-width: 120px;
+            }}
+            QComboBox:hover {{
+                border: 1px solid {ACCENT_COLOR};
+            }}
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 20px;
+                border-left: 1px solid {BORDER_COLOR};
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {DARK_BG_COLOR};
+                color: {TEXT_COLOR};
+                selection-background-color: {ACCENT_COLOR};
+                selection-color: white;
+                border: 1px solid {BORDER_COLOR};
+            }}
+        """)
+        toolbar_layout.addWidget(self.sort_combo)
         
-        # Apply filters button
-        self.apply_filters_button = QPushButton("Apply Filters")
-        self.apply_filters_button.clicked.connect(self.on_search)
+        # Add spacer
+        toolbar_layout.addStretch()
         
-        # Add to sidebar
-        sidebar_layout.addWidget(filters_label)
-        sidebar_layout.addWidget(category_label)
-        sidebar_layout.addWidget(self.category_combo)
-        sidebar_layout.addWidget(file_type_label)
-        sidebar_layout.addWidget(self.file_type_combo)
-        sidebar_layout.addWidget(self.apply_filters_button)
+        # Refresh button
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                color: {SECONDARY_TEXT_COLOR};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 4px;
+                padding: 5px 15px;
+            }}
+            QPushButton:hover {{
+                color: {TEXT_COLOR};
+                border-color: {ACCENT_COLOR};
+            }}
+        """)
+        self.refresh_button.clicked.connect(self.load_assets)
+        toolbar_layout.addWidget(self.refresh_button)
         
-        # Actions
-        actions_label = QLabel("Actions")
-        actions_label.setStyleSheet("font-weight: bold;")
+        # Import local button
+        self.import_button = QPushButton("Import Local")
+        self.import_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {ACCENT_COLOR};
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 5px 15px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: {ACCENT_COLOR_HOVER};
+            }}
+        """)
+        self.import_button.clicked.connect(self.import_local_assets)
+        toolbar_layout.addWidget(self.import_button)
         
-        # Scan directory button
-        self.scan_button = QPushButton("Scan Directory")
-        self.scan_button.clicked.connect(self.on_scan_directory)
+        right_layout.addWidget(toolbar)
         
-        # Rebuild index button
-        self.rebuild_index_button = QPushButton("Rebuild Index")
-        self.rebuild_index_button.clicked.connect(self.on_rebuild_index)
+        # Create asset grid
+        self.asset_grid = AssetGridWidget()
+        right_layout.addWidget(self.asset_grid)
         
-        # Add to sidebar
-        sidebar_layout.addWidget(actions_label)
-        sidebar_layout.addWidget(self.scan_button)
-        sidebar_layout.addWidget(self.rebuild_index_button)
-        
-        # Add spacer to push everything to the top
-        sidebar_layout.addStretch()
-        
-        # Content area
-        content = QWidget()
-        content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        
-        # Tabs for local and online assets
-        self.tabs = QTabWidget()
-        
-        # Local assets tab
-        local_tab = QWidget()
-        local_layout = QVBoxLayout(local_tab)
-        
-        # Results list
-        self.results_list = QListWidget()
-        self.results_list.setIconSize(QSize(64, 64))
-        self.results_list.itemDoubleClicked.connect(self.on_asset_double_clicked)
-        
-        local_layout.addWidget(self.results_list)
-        
-        # Online assets tab
-        online_tab = QWidget()
-        online_layout = QVBoxLayout(online_tab)
-        
-        # Provider selection
-        provider_layout = QHBoxLayout()
-        provider_label = QLabel("Provider:")
-        self.provider_combo = QComboBox()
-        
-        # Add available providers
-        for provider in integration_manager.get_providers():
-            self.provider_combo.addItem(provider)
-        
-        provider_layout.addWidget(provider_label)
-        provider_layout.addWidget(self.provider_combo)
-        provider_layout.addStretch()
-        
-        # Online search button
-        self.online_search_button = QPushButton("Search Online")
-        self.online_search_button.clicked.connect(self.on_online_search)
-        provider_layout.addWidget(self.online_search_button)
-        
-        online_layout.addLayout(provider_layout)
-        
-        # Online results list
-        self.online_results_list = QListWidget()
-        self.online_results_list.setIconSize(QSize(64, 64))
-        self.online_results_list.itemDoubleClicked.connect(self.on_online_asset_double_clicked)
-        
-        online_layout.addWidget(self.online_results_list)
-        
-        # Add tabs
-        self.tabs.addTab(local_tab, "Local Assets")
-        self.tabs.addTab(online_tab, "Online Assets")
-        
-        content_layout.addWidget(self.tabs)
-        
-        # Add sidebar and content to splitter
-        splitter.addWidget(sidebar)
-        splitter.addWidget(content)
-        
-        # Set initial sizes
-        splitter.setSizes([200, 800])
-        
-        main_layout.addWidget(splitter)
-        
-        # Status bar
+        # Create status bar
         self.status_bar = QStatusBar()
+        self.status_bar.setStyleSheet(f"""
+            QStatusBar {{
+                background-color: {DARKER_BG_COLOR};
+                color: {SECONDARY_TEXT_COLOR};
+                border-top: 1px solid {BORDER_COLOR};
+            }}
+        """)
         self.setStatusBar(self.status_bar)
         
-        # Progress bar (hidden by default)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 0)  # Indeterminate
-        self.progress_bar.setVisible(False)
-        self.status_bar.addPermanentWidget(self.progress_bar)
+        # Add right container to main layout
+        main_layout.addWidget(right_container)
         
-        # Set initial status
-        self.status_bar.showMessage("Ready")
-    
-    def load_categories(self):
-        """Load categories into the category filter."""
-        self.category_combo.clear()
-        self.category_combo.addItem("All Categories")
+        # Set central widget
+        self.setCentralWidget(central_widget)
         
-        categories = self.search.get_categories()
-        for category in categories:
-            self.category_combo.addItem(category)
-    
-    def load_file_types(self):
-        """Load file types into the file type filter."""
-        self.file_type_combo.clear()
-        self.file_type_combo.addItem("All Types")
-        
-        file_types = self.search.get_file_types()
-        for file_type in file_types:
-            self.file_type_combo.addItem(file_type)
-    
-    @Slot()
-    def on_search(self):
-        """Handle search button click."""
-        query = self.search_input.text()
-        
-        # Get filters
-        filters = {}
-        
-        category = self.category_combo.currentText()
-        if category != "All Categories":
-            filters["categories"] = category
-        
-        file_type = self.file_type_combo.currentText()
-        if file_type != "All Types":
-            filters["file_type"] = file_type
-        
-        # Show progress
-        self.progress_bar.setVisible(True)
-        self.status_bar.showMessage("Searching...")
-        
-        # Start search in a separate thread
-        self.search_worker = SearchWorker(query, filters)
-        self.search_worker.results.connect(self.on_search_results)
-        self.search_worker.finished.connect(self.on_search_finished)
-        self.search_worker.start()
-    
-    @Slot(list)
-    def on_search_results(self, results):
-        """Handle search results."""
-        self.results_list.clear()
-        
-        for result in results:
-            item = QListWidgetItem()
-            item.setText(result.get("name", ""))
-            item.setData(Qt.UserRole, result)
-            
-            # Set icon if preview is available
-            preview_path = result.get("preview_path")
-            if preview_path and os.path.exists(preview_path):
-                icon = QIcon(preview_path)
-                item.setIcon(icon)
-            
-            self.results_list.addItem(item)
-        
-        self.status_bar.showMessage(f"Found {len(results)} assets")
-    
-    @Slot()
-    def on_search_finished(self):
-        """Handle search completion."""
-        self.progress_bar.setVisible(False)
-    
-    @Slot()
-    def on_online_search(self):
-        """Handle online search button click."""
-        query = self.search_input.text()
-        provider = self.provider_combo.currentText()
-        
-        if not query:
-            QMessageBox.warning(self, "Search Error", "Please enter a search query")
-            return
-        
-        # Show progress
-        self.progress_bar.setVisible(True)
-        self.status_bar.showMessage(f"Searching {provider}...")
-        
-        # Get provider
-        provider_instance = integration_manager.get_provider(provider)
-        
-        if not provider_instance:
-            QMessageBox.warning(self, "Provider Error", f"Provider {provider} not available")
-            self.progress_bar.setVisible(False)
-            self.status_bar.showMessage("Ready")
-            return
-        
-        # Connect to provider
-        if not provider_instance.connect():
-            QMessageBox.warning(self, "Connection Error", f"Could not connect to {provider}")
-            self.progress_bar.setVisible(False)
-            self.status_bar.showMessage("Ready")
-            return
-        
-        # Search
+    def load_assets(self):
+        """Load assets from the index."""
         try:
-            results = provider_instance.search(query)
-            self.display_online_results(results, provider)
+            # Show loading status
+            self.status_bar.showMessage("Loading assets...")
+            
+            # Get all assets from the index
+            assets = self.search.search("")
+            
+            # Update the asset grid
+            self.asset_grid.set_assets(assets)
+            
+            # Update status bar
+            self.status_bar.showMessage(f"Loaded {len(assets)} assets")
+            
         except Exception as e:
-            logger.error(f"Error searching {provider}: {e}")
-            QMessageBox.warning(self, "Search Error", f"Error searching {provider}: {str(e)}")
-        
-        self.progress_bar.setVisible(False)
-        self.status_bar.showMessage("Ready")
+            logger.error(f"Error loading assets: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to load assets: {str(e)}")
+            self.status_bar.showMessage("Error loading assets")
     
-    def display_online_results(self, results, provider):
-        """
-        Display online search results.
+    def apply_filters(self, filters):
+        """Apply filters to the asset list.
         
         Args:
-            results: Search results
-            provider: Provider name
+            filters: Dictionary of filter values
         """
-        self.online_results_list.clear()
-        
-        result_items = results.get("results", [])
-        
-        for result in result_items:
-            item = QListWidgetItem()
-            item.setText(result.get("name", ""))
+        try:
+            # Show loading status
+            self.status_bar.showMessage("Filtering assets...")
             
-            # Add provider and ID to data
-            result["provider"] = provider
-            item.setData(Qt.UserRole, result)
+            # Build search query
+            query = filters["search"]
             
-            self.online_results_list.addItem(item)
-        
-        self.status_bar.showMessage(f"Found {len(result_items)} assets on {provider}")
-    
-    @Slot()
-    def on_scan_directory(self):
-        """Handle scan directory button click."""
-        directory = QFileDialog.getExistingDirectory(
-            self, "Select Directory to Scan", str(Path.home())
-        )
-        
-        if not directory:
-            return
-        
-        # Show progress
-        self.progress_bar.setVisible(True)
-        self.status_bar.showMessage(f"Scanning directory: {directory}...")
-        
-        # Start scan in a separate thread
-        self.scan_worker = ScanWorker(directory)
-        self.scan_worker.progress.connect(self.on_scan_progress)
-        self.scan_worker.finished.connect(self.on_scan_finished)
-        self.scan_worker.start()
-    
-    @Slot(int, int)
-    def on_scan_progress(self, new_assets, updated_assets):
-        """
-        Handle scan progress.
-        
-        Args:
-            new_assets: Number of new assets found
-            updated_assets: Number of updated assets
-        """
-        self.status_bar.showMessage(
-            f"Scan complete: {new_assets} new assets, {updated_assets} updated"
-        )
-        
-        # If new assets were found, offer to index them
-        if new_assets > 0 or updated_assets > 0:
-            reply = QMessageBox.question(
-                self, "Index Assets",
-                f"Found {new_assets} new assets and {updated_assets} updated assets. Index them now?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+            # Get filtered assets
+            assets = self.search.search(
+                query, 
+                asset_type=filters["type"], 
+                file_format=filters["format"],
+                source=filters["source"],
+                categories=filters["categories"]
             )
             
-            if reply == QMessageBox.Yes:
-                self.on_rebuild_index()
-    
-    @Slot()
-    def on_scan_finished(self):
-        """Handle scan completion."""
-        self.progress_bar.setVisible(False)
-    
-    @Slot()
-    def on_rebuild_index(self):
-        """Handle rebuild index button click."""
-        # Show progress
-        self.progress_bar.setVisible(True)
-        self.status_bar.showMessage("Rebuilding search index...")
-        
-        # Start indexing in a separate thread
-        self.index_worker = IndexWorker(rebuild=True)
-        self.index_worker.progress.connect(self.on_index_progress)
-        self.index_worker.finished.connect(self.on_index_finished)
-        self.index_worker.start()
-    
-    @Slot(int)
-    def on_index_progress(self, count):
-        """
-        Handle indexing progress.
-        
-        Args:
-            count: Number of indexed assets
-        """
-        self.status_bar.showMessage(f"Indexed {count} assets")
-        
-        # Reload categories and file types
-        self.load_categories()
-        self.load_file_types()
-    
-    @Slot()
-    def on_index_finished(self):
-        """Handle indexing completion."""
-        self.progress_bar.setVisible(False)
-    
-    @Slot(QListWidgetItem)
-    def on_asset_double_clicked(self, item):
-        """
-        Handle double-click on an asset.
-        
-        Args:
-            item: Clicked list item
-        """
-        asset_data = item.data(Qt.UserRole)
-        
-        if not asset_data:
-            return
-        
-        # Show asset details
-        self.show_asset_details(asset_data)
-    
-    @Slot(QListWidgetItem)
-    def on_online_asset_double_clicked(self, item):
-        """
-        Handle double-click on an online asset.
-        
-        Args:
-            item: Clicked list item
-        """
-        asset_data = item.data(Qt.UserRole)
-        
-        if not asset_data:
-            return
-        
-        # Show asset details
-        self.show_online_asset_details(asset_data)
-    
-    def show_asset_details(self, asset_data):
-        """
-        Show details for a local asset.
-        
-        Args:
-            asset_data: Asset data dictionary
-        """
-        # Create a simple message box with asset details
-        details = f"Name: {asset_data.get('name', '')}\n"
-        details += f"Type: {asset_data.get('file_type', '')}\n"
-        details += f"Format: {asset_data.get('file_format', '')}\n"
-        details += f"Path: {asset_data.get('file_path', '')}\n"
-        details += f"Size: {asset_data.get('file_size', 0)} bytes\n"
-        
-        if asset_data.get('vertex_count'):
-            details += f"Vertices: {asset_data.get('vertex_count')}\n"
-        
-        if asset_data.get('face_count'):
-            details += f"Faces: {asset_data.get('face_count')}\n"
-        
-        QMessageBox.information(self, "Asset Details", details)
-    
-    def show_online_asset_details(self, asset_data):
-        """
-        Show details for an online asset.
-        
-        Args:
-            asset_data: Asset data dictionary
-        """
-        provider = asset_data.get("provider", "")
-        asset_id = asset_data.get("id", "")
-        
-        if not provider or not asset_id:
-            return
-        
-        # Show progress
-        self.progress_bar.setVisible(True)
-        self.status_bar.showMessage(f"Fetching details from {provider}...")
-        
-        try:
-            # Get detailed information
-            details = integration_manager.get_asset_details(provider, asset_id)
+            # Update the asset grid
+            self.asset_grid.set_assets(assets)
             
-            if not details:
-                QMessageBox.warning(self, "Error", f"Could not fetch details from {provider}")
-                return
-            
-            # Create a simple message box with asset details
-            details_text = f"Name: {details.get('name', '')}\n"
-            details_text += f"Source: {provider}\n"
-            
-            if details.get('price'):
-                details_text += f"Price: {details.get('price')} {details.get('currency', 'USD')}\n"
-            
-            if details.get('file_formats'):
-                details_text += f"Formats: {', '.join(details.get('file_formats'))}\n"
-            
-            if details.get('vertex_count'):
-                details_text += f"Vertices: {details.get('vertex_count')}\n"
-            
-            if details.get('face_count'):
-                details_text += f"Faces: {details.get('face_count')}\n"
-            
-            if details.get('tags'):
-                details_text += f"Tags: {', '.join(details.get('tags'))}\n"
-            
-            QMessageBox.information(self, "Asset Details", details_text)
+            # Update status bar
+            self.status_bar.showMessage(f"Found {len(assets)} assets")
             
         except Exception as e:
-            logger.error(f"Error fetching details from {provider}: {e}")
-            QMessageBox.warning(self, "Error", f"Error fetching details: {str(e)}")
-        
-        finally:
-            self.progress_bar.setVisible(False)
-            self.status_bar.showMessage("Ready")
+            logger.error(f"Error applying filters: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to apply filters: {str(e)}")
+            self.status_bar.showMessage("Error filtering assets")
+    
+    def import_local_assets(self):
+        """Import assets from local directory."""
+        try:
+            # Show file dialog to select directory
+            directory = QFileDialog.getExistingDirectory(
+                self, "Select Directory", "", QFileDialog.ShowDirsOnly
+            )
+            
+            if directory:
+                # Show progress dialog
+                progress_dialog = QMessageBox(self)
+                progress_dialog.setWindowTitle("Importing Assets")
+                progress_dialog.setText("Scanning directory for assets...")
+                progress_dialog.setStandardButtons(QMessageBox.NoButton)
+                progress_dialog.show()
+                
+                # Process events to update UI
+                QApplication.processEvents()
+                
+                # Scan directory for assets
+                scanner = FileScanner()
+                assets = scanner.scan_directory(directory)
+                
+                # Update progress
+                progress_dialog.setText(f"Found {len(assets)} assets. Indexing...")
+                QApplication.processEvents()
+                
+                # Index assets
+                for asset in assets:
+                    self.indexer.add_asset(asset)
+                
+                # Close progress dialog
+                progress_dialog.close()
+                
+                # Reload assets
+                self.load_assets()
+                
+                # Show success message
+                QMessageBox.information(
+                    self, "Import Complete", 
+                    f"Successfully imported {len(assets)} assets from {directory}"
+                )
+                
+        except Exception as e:
+            logger.error(f"Error importing assets: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to import assets: {str(e)}")
 
 
 def run_app():
     """Run the AssetHub application."""
+    # Set up logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Create application
     app = QApplication(sys.argv)
+    
+    # Set application style
+    app.setStyle("Fusion")
+    
+    # Create and show main window
     window = AssetHubMainWindow()
     window.show()
-    sys.exit(app.exec())
+    
+    # Run application
+    sys.exit(app.exec_())
 
 
 if __name__ == "__main__":
